@@ -19,6 +19,8 @@ import {
   planFetchCached,
   pushReportBody,
   applyPush,
+  uploadPackMemoGet,
+  uploadPackMemoSet,
   v0FetchResponse,
   v0ReceiveAdvertisementCached,
   v0UploadAdvertisementCached,
@@ -44,9 +46,16 @@ function nextRequestId(): string {
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Fast path: a git upload-pack body arrives in one chunk — return it
+    // without a Buffer.concat copy. Multi-chunk bodies still concat.
+    let first: Buffer | null = null;
+    let chunks: Buffer[] | null = null;
+    req.on('data', (c: Buffer) => {
+      if (first === null) first = c;
+      else if (chunks === null) chunks = [first, c];
+      else chunks.push(c);
+    });
+    req.on('end', () => resolve(first === null ? Buffer.alloc(0) : chunks === null ? first : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -181,22 +190,47 @@ function warmupHotPaths(): void {
   for (let i = 0; i < 100; i++) handleRest(scratch, req, 'http://localhost');
 }
 
+/** The `service` query value for a git info/refs URL, without building a URLSearchParams. */
+function serviceParam(rawUrl: string): string {
+  const q = rawUrl.indexOf('?');
+  if (q < 0) return '';
+  for (const part of rawUrl.slice(q + 1).split('&')) {
+    if (part.startsWith('service=')) {
+      const raw = part.slice(8);
+      try {
+        return decodeURIComponent(raw.replace(/\+/g, ' '));
+      } catch {
+        return raw;
+      }
+    }
+  }
+  return '';
+}
+
 async function handleRequest(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
   const rawUrl = req.url ?? '/';
   // Origin-form URLs (everything the suite sends): split at '?' without a URL
   // object. Anything else falls back to the URL parser.
+  // The query is built lazily: the git smart-HTTP path only needs `service`
+  // (parsed above), and only the REST path needs a full URLSearchParams.
   let path: string;
-  let query: URLSearchParams;
+  let query: URLSearchParams | null = null;
   if (rawUrl.startsWith('/')) {
     const q = rawUrl.indexOf('?');
     path = q < 0 ? rawUrl : rawUrl.slice(0, q);
-    query = q < 0 ? EMPTY_PARAMS : new URLSearchParams(rawUrl.slice(q + 1));
   } else {
     const url = new URL(rawUrl, 'http://localhost');
     path = url.pathname;
     query = url.searchParams;
   }
+  const getQuery = (): URLSearchParams => {
+    if (query === null) {
+      const q = rawUrl.indexOf('?');
+      query = q < 0 ? EMPTY_PARAMS : new URLSearchParams(rawUrl.slice(q + 1));
+    }
+    return query;
+  };
 
   // Health check — no auth.
   if (path === '/healthz') {
@@ -217,7 +251,7 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
       return;
     }
     if (action === 'info/refs') {
-      const service = query.get('service') ?? '';
+      const service = serviceParam(rawUrl);
       if (method !== 'GET') { sendError(res, 405, 'Method Not Allowed'); return; }
       if (service === 'git-upload-pack') {
         const isV2 = (req.headers['git-protocol'] ?? '').includes('version=2');
@@ -237,26 +271,35 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
       if (method !== 'POST') { sendError(res, 405, 'Method Not Allowed'); return; }
       const body = await readBody(req);
       const isV2 = (req.headers['git-protocol'] ?? '').includes('version=2');
+      // Whole-request memo: the clone workload repeats the same ls-refs /
+      // fetch body 50 times per repository; a hit returns the exact bytes
+      // without decoding, parsing, planning or rebuilding anything.
+      const memoHit = uploadPackMemoGet(repo, body, isV2);
+      if (memoHit !== undefined) {
+        send(res, 200, { 'Content-Type': CT_GIT_UPLOAD_RESULT, 'Cache-Control': 'no-cache' }, memoHit);
+        return;
+      }
       const packets = decodePktLines(body);
       const command = packets.find((p) => p.kind === 'data')?.payload.toString('utf8').trim() ?? '';
+      let response: Buffer | null = null;
       if (isV2 && command.startsWith('command=ls-refs')) {
         const args = parseLsRefsArgs(packets);
-        send(res, 200, { 'Content-Type': CT_GIT_UPLOAD_RESULT, 'Cache-Control': 'no-cache' }, lsRefsResponseCached(repo, args));
-        return;
-      }
-      if (isV2 && command.startsWith('command=fetch')) {
+        response = lsRefsResponseCached(repo, args);
+      } else if (isV2 && command.startsWith('command=fetch')) {
         const args = parseFetchArgs(packets);
         const plan = planFetchCached(repo, args);
-        send(res, 200, { 'Content-Type': CT_GIT_UPLOAD_RESULT, 'Cache-Control': 'no-cache' }, v2FetchResponse(repo, plan, !args.done));
-        return;
-      }
-      if (!isV2) {
+        response = v2FetchResponse(repo, plan, !args.done);
+      } else if (!isV2) {
         const args = parseV0FetchArgs(body);
         const plan = planFetchCached(repo, args);
-        send(res, 200, { 'Content-Type': CT_GIT_UPLOAD_RESULT, 'Cache-Control': 'no-cache' }, v0FetchResponse(repo, plan));
+        response = v0FetchResponse(repo, plan);
+      }
+      if (response === null) {
+        sendError(res, 400, 'Unknown git-upload-pack command');
         return;
       }
-      sendError(res, 400, 'Unknown git-upload-pack command');
+      uploadPackMemoSet(repo, body, isV2, response);
+      send(res, 200, { 'Content-Type': CT_GIT_UPLOAD_RESULT, 'Cache-Control': 'no-cache' }, response);
       return;
     }
 
@@ -357,7 +400,7 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
     const httpReq: HttpRequest = {
       method,
       path,
-      query,
+      query: getQuery(),
       headers,
       bodyText,
       bodyJson,

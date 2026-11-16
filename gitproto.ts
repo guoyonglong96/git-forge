@@ -163,6 +163,40 @@ export function planFetchCached(repo: Repo, args: FetchArgs): FetchPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Whole-request memo for git-upload-pack POSTs
+// ---------------------------------------------------------------------------
+// The clone workload sends the same ls-refs / fetch POST body for one
+// repository 50 times in a row (identical bytes: same want, deepen, done).
+// The response is a pure function of (refs, objects, body, v2/v0): refs are
+// captured exactly by refsKey, objects are immutable and only added (the
+// size pins the set — nothing is ever removed or replaced, and a recreated
+// repo gets a fresh cache via the WeakMap), and the body is keyed byte for
+// byte (latin1 is a bijection). A hit is therefore byte-identical to a fresh
+// build and skips the pkt decode, arg parse, fetch planning and response
+// key-building on every repeated request. Bodies over 4 KiB (pushes never
+// come here; receive-pack is a different endpoint) and responses over
+// 256 KiB are never cached; 8 entries per repo, FIFO eviction.
+
+const uploadPackCaches = new WeakMap<Repo, Map<string, Buffer>>();
+
+function uploadPackKey(repo: Repo, body: Buffer, isV2: boolean): string | null {
+  if (body.length > 4096) return null;
+  return `${isV2 ? 2 : 0}|${refsKey(repo)}|${repo.objects.size}|${body.toString('latin1')}`;
+}
+
+export function uploadPackMemoGet(repo: Repo, body: Buffer, isV2: boolean): Buffer | undefined {
+  const key = uploadPackKey(repo, body, isV2);
+  if (key === null) return undefined;
+  return memoMap(uploadPackCaches, repo).get(key);
+}
+
+export function uploadPackMemoSet(repo: Repo, body: Buffer, isV2: boolean, response: Buffer): void {
+  const key = uploadPackKey(repo, body, isV2);
+  if (key === null || response.length > 262144) return;
+  memoSet(memoMap(uploadPackCaches, repo), key, response, 8);
+}
+
+// ---------------------------------------------------------------------------
 // v2 ls-refs
 // ---------------------------------------------------------------------------
 
