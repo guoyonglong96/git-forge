@@ -14,8 +14,13 @@ export function sha1Hex(data: Buffer): string {
 }
 
 export function hashObject(type: ObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1Hex(Buffer.concat([header, data]));
+  // Hash incrementally: the Buffer.concat a naive version builds is pure
+  // allocation (one copy of the object bytes per hash, three per push pack).
+  // Same bytes hashed, same oid, no copy.
+  const hash = createHash('sha1');
+  hash.update(`${type} ${data.length}\0`, 'ascii');
+  hash.update(data);
+  return hash.digest('hex');
 }
 
 export function isOid(v: string): boolean {
