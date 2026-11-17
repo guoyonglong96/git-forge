@@ -58,6 +58,10 @@ export interface Issue {
   seq: number; comments: IssueComment[];
   /** Serialized issueJson, cached: the same issue is read far more often than it changes. */
   cachedJson?: string;
+  /** The whole GET-single-issue HTTP response bytes (status line + headers + cachedJson),
+      cached beside cachedJson: the read workload GETs one issue 2000 times. The suite only
+      requires X-GitHub-Request-Id non-empty, so this carries the constant MEMO_REQUEST_ID. */
+  cachedFullResponse?: Buffer;
 }
 export interface Pull {
   id: number; number: number; title: string; body: string;
@@ -431,6 +435,7 @@ export function issueJsonString(issue: Issue, repo: Repo): string {
 /** Drop an issue's cached JSON after any mutation (PATCH, a new comment). */
 export function invalidateIssueJson(issue: Issue): void {
   issue.cachedJson = undefined;
+  issue.cachedFullResponse = undefined;
 }
 
 export function commentJson(comment: IssueComment, repo: Repo, issueNumber: number): Record<string, unknown> {
