@@ -179,9 +179,13 @@ export function planFetchCached(repo: Repo, args: FetchArgs): FetchPlan {
 
 const uploadPackCaches = new WeakMap<Repo, Map<string, Buffer>>();
 
-function uploadPackKey(repo: Repo, body: Buffer, isV2: boolean): string | null {
+export function uploadPackMemoKey(repo: Repo, body: Buffer, isV2: boolean): string | null {
   if (body.length > 4096) return null;
   return `${isV2 ? 2 : 0}|${refsKey(repo)}|${repo.objects.size}|${body.toString('latin1')}`;
+}
+
+function uploadPackKey(repo: Repo, body: Buffer, isV2: boolean): string | null {
+  return uploadPackMemoKey(repo, body, isV2);
 }
 
 export function uploadPackMemoGet(repo: Repo, body: Buffer, isV2: boolean): Buffer | undefined {
@@ -596,6 +600,19 @@ export function applyPush(
     if (cmd.newOid === current) {
       results.push({ ref: cmd.ref, ok: true, reason: '' });
       continue;
+    }
+    // Fast path for the common linear push: the new commit's parent is the
+    // current tip, so it is a fast-forward without walking the graph
+    // (isAncestor's BFS + Set allocation). Every other shape falls through
+    // to the general check below; a tag newOid never takes this branch.
+    const newObj = repo.objects.get(cmd.newOid);
+    if (newObj?.type === 'commit') {
+      const parents = parseCommit(newObj.data).parents;
+      if (parents.includes(current)) {
+        repo.refs.set(cmd.ref, cmd.newOid);
+        results.push({ ref: cmd.ref, ok: true, reason: '' });
+        continue;
+      }
     }
     const newCommit = store_peelToCommit(repo, cmd.newOid);
     if (newCommit === null || !isAncestor(current, newCommit, lookup)) {
