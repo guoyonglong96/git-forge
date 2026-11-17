@@ -1,4 +1,5 @@
-import { createApp } from "./app.ts";
+import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const rawEnv = process.env.MAKEFUN_ENV_URL;
 let envOrigin = rawEnv === undefined ? "" : rawEnv;
@@ -70,21 +71,72 @@ const waitForDone = async (): Promise<void> => {
   }
 };
 
-const main = async (): Promise<void> => {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, () => resolve());
+// Spawn ./forge (resolved relative to this file, never via $PATH or cwd)
+// and wait for its "[entry] listening on port <N>" line on stdout.
+// The child's stdio is forwarded so the trial's entry.log keeps its logs.
+// Rejects if the child exits or stays silent (boot budget is 20 s).
+const spawnForge = (): Promise<{ child: ChildProcess; port: number }> => {
+  return new Promise((resolve, reject) => {
+    const forgePath = fileURLToPath(new URL("./forge", import.meta.url));
+    const child = spawn(forgePath, [], { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    let settled = false;
+    let stdoutBuf = "";
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(new Error("the Go server did not print its listening port in time"));
+    }, 15_000);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      process.stdout.write(chunk);
+      if (settled) return;
+      stdoutBuf += chunk.toString("utf8");
+      const m = stdoutBuf.match(/\[entry\] listening on port (\d+)/);
+      if (m) {
+        settled = true;
+        clearTimeout(timer);
+        resolve({ child, port: Number(m[1]) });
+      }
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      process.stderr.write(chunk);
+    });
+    child.once("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once("exit", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`the Go server exited early with code ${code} signal ${signal}`));
+    });
   });
-  const address = server.address();
-  if (address === null || typeof address === "string") {
-    throw new Error("the server did not bind an ephemeral TCP port");
-  }
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
-  await register(address.port);
+};
+
+const main = async (): Promise<void> => {
+  const { child, port } = await spawnForge();
+  // If the child dies before /done, exit 1 promptly instead of polling
+  // /done forever.
+  let finished = false;
+  child.once("exit", (code, signal) => {
+    if (finished) return;
+    process.stderr.write(`[entry] Go server exited early with code ${code} signal ${signal}\n`);
+    process.exit(1);
+  });
+  await register(port);
   process.stdout.write("[entry] registered; waiting for the env to say done\n");
   await waitForDone();
-  server.close();
+  finished = true;
+  child.kill("SIGTERM");
+  await Promise.race([
+    new Promise<void>((resolve) => child.once("exit", () => resolve())),
+    sleep(2000).then(() => {
+      child.kill("SIGKILL");
+    }),
+  ]);
   process.stdout.write("[entry] done\n");
 };
 
