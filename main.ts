@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { chmodSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const rawEnv = process.env.MAKEFUN_ENV_URL;
@@ -78,6 +79,14 @@ const waitForDone = async (): Promise<void> => {
 const spawnForge = (): Promise<{ child: ChildProcess; port: number }> => {
   return new Promise((resolve, reject) => {
     const forgePath = fileURLToPath(new URL("./forge", import.meta.url));
+    // GitHub web upload drops the executable bit (mode 100644), so make the
+    // vendored binary executable here before spawning it. Best-effort: if
+    // this fails, spawn below surfaces the real error.
+    try {
+      chmodSync(forgePath, 0o755);
+    } catch {
+      // fall through; spawn will fail with the underlying reason
+    }
     const child = spawn(forgePath, [], { stdio: ["ignore", "pipe", "pipe"], env: process.env });
     let settled = false;
     let stdoutBuf = "";
