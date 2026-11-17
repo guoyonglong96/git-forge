@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync } from "node:fs";
+import { chmodSync, copyFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const rawEnv = process.env.MAKEFUN_ENV_URL;
@@ -72,22 +74,13 @@ const waitForDone = async (): Promise<void> => {
   }
 };
 
-// Spawn ./forge (resolved relative to this file, never via $PATH or cwd)
-// and wait for its "[entry] listening on port <N>" line on stdout.
+// Try to start the Go server from one binary path. Resolves once the child
+// prints "[entry] listening on port <N>". Rejects on error, early exit, or
+// if the line does not appear within the boot budget.
 // The child's stdio is forwarded so the trial's entry.log keeps its logs.
-// Rejects if the child exits or stays silent (boot budget is 20 s).
-const spawnForge = (): Promise<{ child: ChildProcess; port: number }> => {
+const trySpawn = (binPath: string): Promise<{ child: ChildProcess; port: number }> => {
   return new Promise((resolve, reject) => {
-    const forgePath = fileURLToPath(new URL("./forge", import.meta.url));
-    // GitHub web upload drops the executable bit (mode 100644), so make the
-    // vendored binary executable here before spawning it. Best-effort: if
-    // this fails, spawn below surfaces the real error.
-    try {
-      chmodSync(forgePath, 0o755);
-    } catch {
-      // fall through; spawn will fail with the underlying reason
-    }
-    const child = spawn(forgePath, [], { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    const child = spawn(binPath, [], { stdio: ["ignore", "pipe", "pipe"], env: process.env });
     let settled = false;
     let stdoutBuf = "";
     const timer = setTimeout(() => {
@@ -123,6 +116,37 @@ const spawnForge = (): Promise<{ child: ChildProcess; port: number }> => {
       reject(new Error(`the Go server exited early with code ${code} signal ${signal}`));
     });
   });
+};
+
+// Spawn ./forge (resolved relative to this file, never via $PATH or cwd)
+// and wait for its "[entry] listening on port <N>" line on stdout.
+// The vendored binary may lack the executable bit (GitHub web upload stores
+// it as 100644) and the repo may be read-only on the grading host, so:
+//  1. try chmod + spawn in place;
+//  2. if that fails, copy the binary to the OS temp dir, chmod the copy,
+//     and spawn the copy (the repo is only read, never written, there).
+// Rejects if neither attempt starts the server.
+const spawnForge = async (): Promise<{ child: ChildProcess; port: number }> => {
+  const forgePath = fileURLToPath(new URL("./forge", import.meta.url));
+  // GitHub web upload drops the executable bit (mode 100644), so make the
+  // vendored binary executable here before spawning it. Best-effort: if
+  // this fails, spawn below surfaces the real error.
+  try {
+    chmodSync(forgePath, 0o755);
+  } catch {
+    // fall through; spawn will fail with the underlying reason
+  }
+  try {
+    return await trySpawn(forgePath);
+  } catch (err) {
+    process.stderr.write(
+      `[entry] direct spawn failed (${err instanceof Error ? err.message : String(err)}); trying a copy in the temp dir\n`,
+    );
+  }
+  const tmpPath = join(tmpdir(), `forge-${process.pid}`);
+  copyFileSync(forgePath, tmpPath);
+  chmodSync(tmpPath, 0o755);
+  return await trySpawn(tmpPath);
 };
 
 const main = async (): Promise<void> => {
